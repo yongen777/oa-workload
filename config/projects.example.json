@@ -1,0 +1,35 @@
+{
+  "_说明": "复制为 projects.json。projects 是数组，code 决定目录名（short 留空则目录名就是 code）。",
+  "_注意": "真实项目编号/客户名等业务字段不要提交到公开仓库，只填本地文件。",
+
+  "projects": [
+    {
+      "code": "项目名或编号",
+      "short": "",
+      "name": "项目全称",
+      "source": "",
+      "group": "",
+      "leader": "",
+      "client": "",
+      "industry": "",
+      "status": "进行中",
+      "members": [
+        { "name": "你的名字", "account": "", "role": "软研开发" }
+      ],
+
+      "brief": {
+        "_brief说明": "可选。仅用于生成给主管看的项目简介；留空会渲染成【待补】",
+        "background": "",
+        "scope": "",
+        "out_of_scope": "",
+        "stages": [
+          { "stage": "需求 / 调研", "deliverables": "需求记录、需求设计文档" },
+          { "stage": "设计", "deliverables": "系统设计、数据库设计、功能设计文档" },
+          { "stage": "开发", "deliverables": "功能模块代码" },
+          { "stage": "测试", "deliverables": "测试方案、测试用例、测试记录" },
+          { "stage": "交付", "deliverables": "软件部署手册、问题处理手册" }
+        ]
+      }
+    }
+  ]
+}
