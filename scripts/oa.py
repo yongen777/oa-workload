@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""OA 工时台账 CLI —— stdlib only。
+"""云中台OA工时台账 CLI —— stdlib only。
 
 除 xlsx 导出外无第三方依赖；未安装 openpyxl 时自动降级 CSV（OA 只收 xls/xlsx，
 降级后须用 WPS 另存，脚本会明确提示）。
@@ -348,7 +348,7 @@ def cmd_log(a):
                 die(
                     f"[拒绝登记] 交付内容「{dv['content']}」不在软研队伍白名单内。\n"
                     f"  可用值：{'、'.join(wl)}\n"
-                    f"  依据：OA 手册中该队伍的交付物白名单。\n"
+                    f"  依据：云中台OA操作手册 P87（新增/修改的研发过程文档 15 类）。\n"
                     f"  与项目无关的材料（如工时台账整理、OA 填报核对）一律不得登记为项目交付物。"
                 )
 
@@ -378,13 +378,22 @@ def cmd_log(a):
         "source": a.source or "manual",
     }
     append_ledger(entry)
+    _write_day(p, d)
 
-    base = project_dir(p, d)
-    day = base / settings()["paths"]["date_label"].format(d)
+    _u(f"✅ 已登记  {d}  {p['code']}  工时 {sum(e['hours'] for e in entry['entries']):.1f}h  交付物 {entry['qty']} 件")
+    _u(f"   台账 {ledger_path()}")
+    for w in warn:
+        _u(f"   ⚠️ 枚举未校验：{w}")
+    if hits:
+        _u(f"   🔒 脱敏命中（上传前务必处理）：{sorted(hits)}")
+
+
+def _write_day(p: dict, d: dt.date) -> Path:
+    """按台账聚合渲染某天的「当日填报.md」，返回日目录。log 与 rerender 共用。"""
+    day = project_dir(p, d) / settings()["paths"]["date_label"].format(d)
     day.mkdir(parents=True, exist_ok=True)
     (day / "交付物").mkdir(exist_ok=True)
 
-    # 当天明细直接从台账聚合（不再落 daily_manifest.json，用户要求日文件夹只留人读的填报 + 附件）
     logs = [r for r in read_ledger()
             if r.get("project") == p["code"] and r.get("date") == d.isoformat()]
     types, entries, delivs = [], [], []
@@ -430,13 +439,19 @@ def cmd_log(a):
     M.append(f"3. 附件从本目录 `交付物\\` 取（{total_q} 件）")
     M.append("4. ⚠️ 交付物请脱敏后上传")
     (day / "当日填报.md").write_text("\n".join(M) + "\n", encoding="utf-8")
+    return day
 
-    _u(f"✅ 已登记  {d}  {p['code']}  工时 {sum(e['hours'] for e in entries):.1f}h  交付物 {entry['qty']} 件")
-    _u(f"   台账 {ledger_path()}")
-    for w in warn:
-        _u(f"   ⚠️ 枚举未校验：{w}")
-    if hits:
-        _u(f"   🔒 脱敏命中（上传前务必处理）：{sorted(hits)}")
+
+def cmd_rerender(a):
+    """按台账重渲染所有「当日填报.md」（改了附件名/文件名后用它，不要重新 log）。"""
+    p = resolve_project(a.project)
+    dates = sorted({r["date"] for r in read_ledger() if r.get("project") == p["code"]})
+    if a.date:
+        dates = [x for x in dates if x == a.date]
+    for ds in dates:
+        day = _write_day(p, dt.date.fromisoformat(ds))
+        _u(f"  ✅ {ds}  {day}")
+    _u(f"重渲染 {len(dates)} 天")
 
 
 def cmd_audit(a):
@@ -521,7 +536,7 @@ def cmd_export_week(a):
 
     L = []
     L.append("=" * 68)
-    L.append("【OA 工时填报对照文本】")
+    L.append("【云中台OA 工时填报对照文本】")
     L.append("=" * 68)
     L.append(f"项目名称：{p.get('name') or '【待补】'}")
     L.append(f"项目编号：{p['code']}")
@@ -819,7 +834,7 @@ def cmd_harvest(a):
 # ---------------------------------------------------------------- 入口
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="oa.py", description="OA 工时台账")
+    ap = argparse.ArgumentParser(prog="oa.py", description="云中台OA工时台账")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("status", help="当前周/月/闸门概览"); s.set_defaults(fn=cmd_status)
@@ -834,6 +849,9 @@ def main(argv=None):
     s.add_argument("--deliverable", action="append", help='交付内容|数量|文件名，可重复')
     s.add_argument("--source", default="manual")
     s.set_defaults(fn=cmd_log)
+
+    s = sub.add_parser("rerender", help="按台账重渲染当日填报（改文件名后用）")
+    s.add_argument("--project"); s.add_argument("--date"); s.set_defaults(fn=cmd_rerender)
 
     s = sub.add_parser("audit", help="配额核算")
     s.add_argument("--month"); s.set_defaults(fn=cmd_audit)

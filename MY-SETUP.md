@@ -94,6 +94,24 @@ C:\Users\lenovo\OA\
 | 6 | 不体现"提前做/补交"等元信息 | 交付物正文不得出现时间元叙述 |
 | 7 | 交付物需脱敏 | 内网 IP、账号、手机号、密钥命中会告警 |
 | 8 | 不自动提交 OA | 只产出文本，提交由人点 |
+| 9 | **附件格式只用系统认的** | 文档类一律 `.docx`（OA 不收 `.md`）；代码类 `.zip`；DDL 用 `.sql`，若系统也不收则转 docx |
+| 10 | **代码包 ≥100 行有效代码** | 打 zip 前统计 `.py/.ts/.tsx/.js/.sql/.sh/.html/.css` 行数，不足 100 行说明该交付单元太薄，合并到相邻交付物或换更完整的范围 |
+
+### 4.1 文档格式转换（md → docx）
+
+`md` 不能直接上传，所以交付物里的文档统一转成 `docx`。两条路：
+
+```bash
+# 主路：Word COM（需要 Word + pywin32）
+python scripts/md2docx.py   <项目根目录>     # md → html → Word 另存 docx
+python scripts/fix_heading.py <项目根目录>   # 回填 Heading1/2/3（HTML 导入会丢标题样式）
+```
+
+- `md2docx.py` 依赖 `pywin32` 与本机 Word；**没有 Word 时不可用**。
+- `fix_heading.py` 是**纯标准库**，直接改 OOXML；即使 Word 不在也能修标题。
+- 转换后**删掉原 md**，并把 `ledger.jsonl` 里对应 `file` 的 `.md` 改成 `.docx`，再跑 `rerender` + `export-week`，否则件数与附件会对不上。
+
+> 本机 2026-10-21 实测：`pip install python-docx` 中断后把 `pywin32` 的 `win32api/pythoncom` 弄坏了，Word COM 失效。恢复：`pip install --force-reinstall pywin32`。
 
 ## 五、日常操作（照这个节奏做）
 
