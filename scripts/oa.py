@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""云中台OA工时台账 CLI —— stdlib only。
+"""OA 工时台账 CLI —— stdlib only。
 
 除 xlsx 导出外无第三方依赖；未安装 openpyxl 时自动降级 CSV（OA 只收 xls/xlsx，
 降级后须用 WPS 另存，脚本会明确提示）。
@@ -16,6 +16,7 @@ import datetime as dt
 import json
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -200,10 +201,19 @@ def qty_of(entry: dict) -> int:
 
 
 def audit(month: str, today: dt.date | None = None) -> dict:
+    """工作量核算。
+
+    2026-10-30 规则变更（用户口径）：
+      · 不再设「日最低工作量」，也不设日上限 / 区间目标；
+      · 当日件数 = 当天真实产出（含我协助的部分 + teleagent / AI Studio 等工具的执行结果）；
+      · month_min / week_min 降级为 OA 的**参考线**，只提示、不驱动生成；
+      · 仅当 quota.mode = "strict" 时才拦截出单。
+    """
     today = today or dt.date.today()
     cfg = settings()
-    month_min = int(cfg["quota"]["month_min"])
-    week_min = int(cfg["quota"]["week_min"])
+    month_ref = int(cfg["quota"].get("month_min", 30))
+    week_ref = int(cfg["quota"].get("week_min", 8))
+    mode = str(cfg["quota"].get("mode", "report")).lower()
     m_start, m_end = month_bounds(month)
 
     rows = [r for r in read_ledger() if m_start <= dt.date.fromisoformat(r["date"]) <= m_end]
@@ -211,47 +221,66 @@ def audit(month: str, today: dt.date | None = None) -> dict:
 
     ws, we = oa_week(today)
     week_total = sum(qty_of(r) for r in rows if ws <= dt.date.fromisoformat(r["date"]) <= we)
+    today_rows = [r for r in rows if r["date"] == today.isoformat()]
+    today_qty = sum(qty_of(r) for r in today_rows)
+    today_hours = sum(float(e.get("hours") or 0) for r in today_rows for e in r.get("entries") or [])
 
-    # 口径：当月 = 按已过周数递进；已过月份 = 按整月 30 件结算；未来月份 = 不设闸
+    per_day: dict[str, int] = {}
+    per_source: dict[str, dict] = {}
+    per_project: dict[str, int] = {}
+    for r in rows:
+        ds = r["date"]
+        per_day[ds] = per_day.get(ds, 0) + qty_of(r)
+        per_project[r["project"]] = per_project.get(r["project"], 0) + qty_of(r)
+        src = r.get("source") or "manual"
+        b = per_source.setdefault(src, {"qty": 0, "hours": 0.0, "days": []})
+        b["qty"] += qty_of(r)
+        b["hours"] += sum(float(e.get("hours") or 0) for e in r.get("entries") or [])
+        if ds not in b["days"]:
+            b["days"].append(ds)
+
+    # 参考线（不是闸门）：当月按已过周数递进；已过月份按整月；未来月份不计
     cur_month = today.strftime("%Y-%m")
     is_current = month == cur_month
     is_past = month < cur_month
     all_weeks = oa_weeks_in(m_start, m_end)
-
     if is_current:
         elapsed = [w for w in all_weeks if w[1] <= today]
-        expected = min(week_min * len(elapsed), month_min) if elapsed else 0
+        ref_now = min(week_ref * len(elapsed), month_ref) if elapsed else 0
     elif is_past:
         elapsed = all_weeks
-        expected = month_min
+        ref_now = month_ref
     else:
         elapsed = []
-        expected = 0
+        ref_now = 0
 
-    per_project: dict[str, int] = {}
-    for r in rows:
-        per_project[r["project"]] = per_project.get(r["project"], 0) + qty_of(r)
-
-    reasons = []
-    if month_total < expected:
-        tag = "应达" if is_current else "整月应达"
-        reasons.append(f"月度累计 {month_total} 件 < {tag} {expected} 件（差 {expected - month_total}）")
-    if is_current and elapsed and week_total < week_min:
-        reasons.append(f"本周 {week_total} 件 < 周底线 {week_min} 件（差 {week_min - week_total}）")
+    notes = []
+    if month_total < ref_now:
+        notes.append(
+            f"月度累计 {month_total} 件，低于 OA 参考线 {ref_now} 件（差 {ref_now - month_total}）；"
+            + ("strict 模式：本次出单被拦截。"
+               if mode == "strict" else "report 模式：仅提示，不影响当日登记与出单。")
+        )
 
     return {
         "month": month,
+        "mode": mode,
         "month_total": month_total,
-        "month_min": month_min,
+        "month_min": month_ref,
         "week_start": ws.isoformat(),
         "week_end": we.isoformat(),
         "week_total": week_total,
-        "week_min": week_min,
+        "week_min": week_ref,
+        "today": today.isoformat(),
+        "today_qty": today_qty,
+        "today_hours": today_hours,
+        "per_day": dict(sorted(per_day.items())),
+        "per_source": per_source,
         "elapsed_weeks": len(elapsed),
-        "expected_now": expected,
+        "expected_now": ref_now,
         "per_project": per_project,
-        "blocked": bool(reasons),
-        "reasons": reasons,
+        "blocked": mode == "strict" and bool(notes),
+        "reasons": notes,
     }
 
 
@@ -266,22 +295,36 @@ def cmd_status(a):
     _u(f"当前 OA 周  {s} ~ {e}   →  目录名 {week_label(today)}")
     root = (cfg.get("workspace_root") or "").strip()
     _u(f"工作区      {root or '⚠️ 未配置 workspace_root'}")
-    _u(f"队伍档位    {cfg.get('profile')}   闸门模式 {cfg.get('quota', {}).get('mode')}")
     try:
         rep = audit(today.strftime("%Y-%m"))
     except SystemExit:
         _u("=" * 62)
         return
+    _u(f"队伍档位    {cfg.get('profile')}   核算模式 {rep['mode']}（report=只统计不拦截）")
     _u("-" * 62)
-    _u(f"本月累计    {rep['month_total']} / {rep['month_min']} 件   "
-       f"（已过 {rep['elapsed_weeks']} 个 OA 周，本周应达 {rep['expected_now']} 件）")
-    _u(f"本周累计    {rep['week_total']} / {rep['week_min']} 件")
+    _u(f"今日工作量  {rep['today']}  {rep['today_qty']} 件 · {rep['today_hours']:g}h"
+       f"   （按当日真实产出统计，无下限/上限）")
+    _u(f"本周累计    {rep['week_total']} 件   （OA 参考线 {rep['week_min']} 件，仅提示）")
+    _u(f"本月累计    {rep['month_total']} 件   （OA 参考线 {rep['month_min']} 件，仅提示）")
+    if rep["per_source"]:
+        _u("来源分布（本月）：")
+        for src, b in sorted(rep["per_source"].items(), key=lambda kv: -kv[1]["qty"]):
+            _u(f"  - {src}: {b['qty']} 件 / {b['hours']:g}h / {len(b['days'])} 天")
+    if rep["per_day"]:
+        _u("每日件数（最近 5 天）：")
+        for ds, n in list(rep["per_day"].items())[-5:]:
+            _u(f"  - {ds}: {n} 件")
     if rep["per_project"]:
         _u("分项目：")
         for code, n in sorted(rep["per_project"].items(), key=lambda kv: -kv[1]):
             _u(f"  - {code}: {n}")
     _u("-" * 62)
-    _u("闸门状态    " + ("🔴 已拦截（" + "；".join(rep["reasons"]) + "）" if rep["blocked"] else "🟢 可出单"))
+    if rep["blocked"]:
+        _u("闸门状态    🔴 已拦截（strict 模式）—— " + "；".join(rep["reasons"]))
+    elif rep["reasons"]:
+        _u("参考线       🟡 " + "；".join(rep["reasons"]))
+    else:
+        _u("参考线       🟢 已达 OA 参考线")
     _u("=" * 62)
 
 
@@ -322,6 +365,23 @@ def _parse_entry(s: str) -> dict:
     return {"item": parts[0], "hours": hours, "desc": parts[2]}
 
 
+SOURCE_ALIAS = {
+    "tele_agent": "teleagent", "teleagent": "teleagent", "tele": "teleagent",
+    "aistudio": "ai_studio", "ai_studio": "ai_studio", "aistudio_web": "ai_studio",
+    "workbuddy": "workbuddy", "wb": "workbuddy", "assistant": "workbuddy",
+    "manual": "manual", "self": "manual",
+}
+
+
+def norm_source(s: str | None) -> str:
+    """把来源标签归一化。统计要求「所有来源都计入，不得遗漏」，
+    所以任何未识别的来源都保留原值，不丢弃。"""
+    raw = (s or "").strip().lower().replace(" ", "_").replace("-", "_")
+    if not raw:
+        return "workbuddy"
+    return SOURCE_ALIAS.get(raw, raw)
+
+
 def cmd_log(a):
     p = resolve_project(a.project)
     d = dt.date.fromisoformat(a.date) if a.date else dt.date.today()
@@ -348,17 +408,22 @@ def cmd_log(a):
                 die(
                     f"[拒绝登记] 交付内容「{dv['content']}」不在软研队伍白名单内。\n"
                     f"  可用值：{'、'.join(wl)}\n"
-                    f"  依据：云中台OA操作手册 P87（新增/修改的研发过程文档 15 类）。\n"
+                    f"  依据：该队伍的交付物白名单（新增/修改的研发过程文档）。\n"
                     f"  与项目无关的材料（如工时台账整理、OA 填报核对）一律不得登记为项目交付物。"
                 )
 
+    # 2026-10-30：单日/单交付内容的件数限制默认关闭（0 = 不限）。
+    # 真实工作量大就如实登记，不再人为压缩；只有配置成 >0 时才做「防手滑」提示（仍不拒绝）。
     sanity = settings().get("quota", {}).get("sanity", {})
-    cap_d = int(sanity.get("max_qty_per_day", 12))
-    if sum(x["qty"] for x in delivs) > cap_d:
-        die(f"[异常] 单日交付物合计 {sum(x['qty'] for x in delivs)} 件 > 上限 {cap_d}，疑似凑数，拒绝登记。")
-    for x in delivs:
-        if x["qty"] > int(sanity.get("max_files_per_deliverable", 5)):
-            die(f"[异常] 单一交付内容「{x['content']}」数量 {x['qty']} > 上限，疑似拆附件凑数。")
+    cap_d = int(sanity.get("max_qty_per_day", 0) or 0)
+    cap_one = int(sanity.get("max_files_per_deliverable", 0) or 0)
+    day_qty = sum(x["qty"] for x in delivs)
+    if cap_d > 0 and day_qty > cap_d:
+        warn.append(f"本次登记 {day_qty} 件 > 配置的单日提示线 {cap_d} 件（仅提示，已照常登记）")
+    if cap_one > 0:
+        for x in delivs:
+            if x["qty"] > cap_one:
+                warn.append(f"交付内容「{x['content']}」数量 {x['qty']} > 提示线 {cap_one}（仅提示，已照常登记）")
 
     pats = [re.compile(x) for x in settings().get("desensitize", {}).get("patterns", [])]
     hits = set()
@@ -375,17 +440,44 @@ def cmd_log(a):
         "entries": entries,
         "deliverables": delivs,
         "qty": sum(x["qty"] for x in delivs),
-        "source": a.source or "manual",
+        "source": norm_source(a.source),
     }
     append_ledger(entry)
     _write_day(p, d)
+    missing = _tidy_deliverables(p, d, delivs)
 
     _u(f"✅ 已登记  {d}  {p['code']}  工时 {sum(e['hours'] for e in entry['entries']):.1f}h  交付物 {entry['qty']} 件")
+    if missing:
+        _u(f"   ⚠️ 附件未找到，请放入 交付物/：{missing}")
     _u(f"   台账 {ledger_path()}")
     for w in warn:
         _u(f"   ⚠️ 枚举未校验：{w}")
     if hits:
         _u(f"   🔒 脱敏命中（上传前务必处理）：{sorted(hits)}")
+
+
+def _tidy_deliverables(p: dict, d: dt.date, delivs: list) -> list:
+    """把登记的附件归位到「日目录/交付物/」；错放在日目录根下的自动移入。返回找不到的文件名。
+
+    2026-10-27 修：此前 log 只创建 交付物/ 空目录、从不搬文件，
+    导致「当日填报.md」让用户去 交付物/ 取附件，而那里永远是空的。
+    """
+    day = project_dir(p, d) / settings()["paths"]["date_label"].format(d)
+    box = day / "交付物"
+    box.mkdir(parents=True, exist_ok=True)
+    missing = []
+    for dv in delivs:
+        name = Path(str(dv.get("file") or "")).name
+        if not name:
+            continue
+        if (box / name).exists():
+            continue
+        src = day / name
+        if src.is_file():
+            shutil.move(str(src), str(box / name))
+        else:
+            missing.append(name)
+    return missing
 
 
 def _write_day(p: dict, d: dt.date) -> Path:
@@ -397,12 +489,22 @@ def _write_day(p: dict, d: dt.date) -> Path:
     logs = [r for r in read_ledger()
             if r.get("project") == p["code"] and r.get("date") == d.isoformat()]
     types, entries, delivs = [], [], []
+    by_source: dict[str, dict] = {}
     for lg in logs:
         for t in (lg.get("work_types") or []):
             if t not in types:
                 types.append(t)
-        entries += lg.get("entries") or []
-        delivs += lg.get("deliverables") or []
+        src = norm_source(lg.get("source"))
+        b = by_source.setdefault(src, {"entries": 0, "hours": 0.0, "qty": 0})
+        for e in lg.get("entries") or []:
+            entries.append(e)
+            b["entries"] += 1
+            b["hours"] += float(e.get("hours") or 0)
+        for dv in lg.get("deliverables") or []:
+            dv = dict(dv)
+            dv["_src"] = src
+            delivs.append(dv)
+            b["qty"] += int(dv.get("qty") or 0)
     total_h = sum(e.get("hours", 0) for e in entries)
     total_q = sum(int(dv.get("qty") or 0) for dv in delivs)
 
@@ -426,13 +528,25 @@ def _write_day(p: dict, d: dt.date) -> Path:
     M.append("")
     M.append("## 三、交付物基础信息（OA「交付内容 + 数量 + 附件」）")
     M.append("")
-    M.append("| # | 交付内容 | 数量 | 附件 |")
-    M.append("|---|---|---|---|")
-    for i, dv in enumerate(delivs, 1):
-        M.append(f"| {i} | {dv['content']} | {dv.get('qty', 0)} | {dv.get('file') or '—'} |")
-    M.append(f"| | **合计** | **{total_q}** | |")
+    M.append("> 当日件数 = 当天真实产出的可独立审查交付物。**无日下限、无日上限、不套区间目标**，")
+    M.append("> 也不为凑月度量而补件；当天产出多少就记多少。")
+    M.append("> 来源含：我协助的产出、teleagent / AI Studio 等工具的执行结果、你手工完成的产出，**全部计入**。")
     M.append("")
-    M.append("## 四、怎么填进 OA")
+    M.append("| # | 交付内容 | 数量 | 附件 | 来源 |")
+    M.append("|---|---|---|---|---|")
+    for i, dv in enumerate(delivs, 1):
+        M.append(f"| {i} | {dv['content']} | {dv.get('qty', 0)} | {dv.get('file') or '—'} | {dv.get('_src', '—')} |")
+    M.append(f"| | **合计** | **{total_q}** | | |")
+    M.append("")
+    M.append("## 四、当日工作量汇总（全部来源）")
+    M.append("")
+    M.append("| 来源 | 事项数 | 工时(h) | 交付物(件) |")
+    M.append("|---|---|---|---|")
+    for src, b in sorted(by_source.items(), key=lambda kv: -kv[1]["qty"]):
+        M.append(f"| {src} | {b['entries']} | {b['hours']:g} | {b['qty']} |")
+    M.append(f"| **合计** | **{len(entries)}** | **{total_h:g}** | **{total_q}** |")
+    M.append("")
+    M.append("## 五、怎么填进 OA")
     M.append("")
     M.append(f"1. 「本周工时录入」{d} 那行：工作类型选上表清单类型，事项清单按第二节逐行填，工时照填")
     M.append("2. 底部「基础信息」：事项清单选全，交付内容按第三节选，数量按第三节")
@@ -466,13 +580,14 @@ def _gap_note(rep: dict, p: dict) -> str:
     gap_w = max(0, rep["week_min"] - rep["week_total"])
     return f"""# 交付物缺口预警单
 
-> 本工具已**锁定本次出单**（`quota.mode = block`）。补足后重跑 `export-week` 即可。
+> 本工具已**锁定本次出单**（`quota.mode = strict`；默认 `report` 不会拦）。补足后重跑 `export-week` 即可。
+> 注意：这里比的是 **OA 月度参考线**，不是「每天必须做多少件」。日常登记仍然只按当日真实产出。
 
-| 项 | 实际 | 应达 | 缺口 |
+| 项 | 实际 | 参考线 | 缺口 |
 |---|---|---|---|
 | 月度累计（{rep['month']}） | {rep['month_total']} 件 | {rep['expected_now']} 件 | **{gap_m} 件** |
 | 本周（{rep['week_start']} ~ {rep['week_end']}） | {rep['week_total']} 件 | {rep['week_min']} 件 | **{gap_w} 件** |
-| 月底线 | {rep['month_total']} 件 | {rep['month_min']} 件 | {max(0, rep['month_min'] - rep['month_total'])} 件 |
+| OA 参考线（月） | {rep['month_total']} 件 | {rep['month_min']} 件 | {max(0, rep['month_min'] - rep['month_total'])} 件 |
 
 **拦截原因**
 """ + "\n".join(f"- {r}" for r in rep["reasons"]) + f"""
@@ -513,11 +628,10 @@ def cmd_export_week(a):
     pkg.mkdir(parents=True, exist_ok=True)
 
     rep = audit(d.strftime("%Y-%m"), today=d)
-    mode = settings()["quota"].get("mode", "block")
-    if rep["blocked"] and mode == "block" and not a.force:
+    if rep["blocked"] and not a.force:
         note = pkg / "缺口预警单.md"
         note.write_text(_gap_note(rep, p), encoding="utf-8")
-        _u(f"🔴 出单已拦截 —— 未达配额。缺口清单：\n   {note}")
+        _u(f"🔴 出单已拦截 —— quota.mode = strict 且未达参考线。缺口清单：\n   {note}")
         for r in rep["reasons"]:
             _u(f"   · {r}")
         _u("   补足后重跑；确需强制出单加 --force（会在文本里打红标）。")
@@ -536,7 +650,7 @@ def cmd_export_week(a):
 
     L = []
     L.append("=" * 68)
-    L.append("【云中台OA 工时填报对照文本】")
+    L.append("【OA 工时填报对照文本】")
     L.append("=" * 68)
     L.append(f"项目名称：{p.get('name') or '【待补】'}")
     L.append(f"项目编号：{p['code']}")
@@ -607,9 +721,20 @@ def cmd_export_week(a):
             if c0 == k:
                 L.append(f"       └ {d0}  {q0} 件  {f0}")
     L.append("")
+    src_qty: dict[str, int] = {}
+    day_qty: dict[str, int] = {}
+    for r in rows:
+        s0 = norm_source(r.get("source"))
+        src_qty[s0] = src_qty.get(s0, 0) + qty_of(r)
+        day_qty[r["date"]] = day_qty.get(r["date"], 0) + qty_of(r)
+
     L.append("-" * 68)
-    L.append(f"  本周交付物合计：{sum(contents.values())} 件")
-    L.append(f"  本月累计：{rep['month_total']} / {rep['month_min']} 件")
+    L.append(f"  本周交付物合计：{sum(contents.values())} 件（按当日真实产出逐日登记，无日下限 / 无日上限）")
+    if day_qty:
+        L.append("  逐日件数：" + "；".join(f"{d0} {n} 件" for d0, n in sorted(day_qty.items())))
+    if src_qty:
+        L.append("  来源分布：" + "；".join(f"{k} {v} 件" for k, v in sorted(src_qty.items(), key=lambda kv: -kv[1])))
+    L.append(f"  本月累计：{rep['month_total']} 件（OA 参考线 {rep['month_min']} 件/月，仅提示、不拦截）")
     L.append("-" * 68)
     L.append("⚠️ 交付物请脱敏后上传，请勿直接上传涉密文件及敏感数据（系统界面原文）")
     L.append("⚠️ 工作内容描述必须填写，要尽可能的详细（系统界面原文）")
@@ -627,7 +752,7 @@ def cmd_export_week(a):
             w.writerow([d0, p["code"], c0, q0, f0, "待确认"])
 
     _u(f"✅ 出单完成\n   {txt}\n   {csvp}")
-    _u(f"   本周 {sum(contents.values())} 件 · 本月 {rep['month_total']}/{rep['month_min']} 件")
+    _u(f"   本周 {sum(contents.values())} 件 · 本月 {rep['month_total']} 件（OA 参考线 {rep['month_min']} 件，仅提示）")
     if unverified:
         _u("   ⚠️ " + ("字典已填但未经系统核对" if has_dict else "字典为空") + "，文本里已打横幅")
 
@@ -732,8 +857,8 @@ def cmd_brief(a):
     L.append("")
     L.append("## 五、当前进展（台账统计，非估算）")
     L.append("")
-    L.append(f"- 统计月 **{month}**：已登记交付物 **{qty_month}** 件（月底线 30 件）")
-    L.append(f"- 本周（{ws} ~ {we}）：**{qty_week}** 件（周底线 8 件）")
+    L.append(f"- 统计月 **{month}**：已登记交付物 **{qty_month}** 件（OA 参考线 30 件/月，仅提示）")
+    L.append(f"- 本周（{ws} ~ {we}）：**{qty_week}** 件（按当日真实产出累计，无日下限/上限）")
     if contents:
         L.append("- 交付内容分布：")
         for k, v in sorted(contents.items(), key=lambda kv: -kv[1]):
@@ -834,7 +959,7 @@ def cmd_harvest(a):
 # ---------------------------------------------------------------- 入口
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="oa.py", description="云中台OA工时台账")
+    ap = argparse.ArgumentParser(prog="oa.py", description="OA 工时台账")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("status", help="当前周/月/闸门概览"); s.set_defaults(fn=cmd_status)
