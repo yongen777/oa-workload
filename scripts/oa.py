@@ -200,6 +200,21 @@ def qty_of(entry: dict) -> int:
     return sum(int(x.get("qty") or 0) for x in entry.get("deliverables", []))
 
 
+def hours_of(entry: dict) -> float:
+    """一次登记（或一条台账行）的工时合计。"""
+    return sum(float(e.get("hours") or 0) for e in entry.get("entries") or [])
+
+
+def policy() -> dict:
+    """2026-11-02 新增：每日工时下限。默认 8.0h（用户口径「必须大于 7.5，不能低于 8」）。"""
+    p = settings().get("workload_policy") or {}
+    return {
+        "min_daily_hours": float(p.get("min_daily_hours", 8.0) or 0),
+        "preferred_daily_hours": p.get("preferred_daily_hours") or [8.0, 9.0],
+        "hours_gate": str(p.get("hours_gate", "block")).lower(),
+    }
+
+
 def audit(month: str, today: dt.date | None = None) -> dict:
     """工作量核算。
 
@@ -226,16 +241,18 @@ def audit(month: str, today: dt.date | None = None) -> dict:
     today_hours = sum(float(e.get("hours") or 0) for r in today_rows for e in r.get("entries") or [])
 
     per_day: dict[str, int] = {}
+    per_day_hours: dict[str, float] = {}
     per_source: dict[str, dict] = {}
     per_project: dict[str, int] = {}
     for r in rows:
         ds = r["date"]
         per_day[ds] = per_day.get(ds, 0) + qty_of(r)
+        per_day_hours[ds] = round(per_day_hours.get(ds, 0.0) + hours_of(r), 2)
         per_project[r["project"]] = per_project.get(r["project"], 0) + qty_of(r)
         src = r.get("source") or "manual"
         b = per_source.setdefault(src, {"qty": 0, "hours": 0.0, "days": []})
         b["qty"] += qty_of(r)
-        b["hours"] += sum(float(e.get("hours") or 0) for e in r.get("entries") or [])
+        b["hours"] += hours_of(r)
         if ds not in b["days"]:
             b["days"].append(ds)
 
@@ -262,9 +279,29 @@ def audit(month: str, today: dt.date | None = None) -> dict:
                if mode == "strict" else "report 模式：仅提示，不影响当日登记与出单。")
         )
 
+    # 每日工时下限（2026-11-02）：OA 每天要报满，低于下限的日子直接点名
+    pol = policy()
+    min_h = pol["min_daily_hours"]
+    lo, hi = (list(pol["preferred_daily_hours"]) + [8.0, 9.0])[:2]
+    days_below = [
+        {"date": ds, "hours": h, "gap": round(min_h - h, 2)}
+        for ds, h in sorted(per_day_hours.items())
+        if min_h > 0 and h < min_h
+    ]
+    hours_notes = [
+        f"{x['date']} 仅 {x['hours']:g}h，低于每日下限 {min_h:g}h（差 {x['gap']:g}h）"
+        for x in days_below
+    ]
+
     return {
         "month": month,
         "mode": mode,
+        "min_daily_hours": min_h,
+        "preferred_daily_hours": [lo, hi],
+        "hours_gate": pol["hours_gate"],
+        "days_below_min": days_below,
+        "hours_blocked": bool(days_below) and pol["hours_gate"] == "block",
+        "hours_notes": hours_notes,
         "month_total": month_total,
         "month_min": month_ref,
         "week_start": ws.isoformat(),
@@ -275,6 +312,7 @@ def audit(month: str, today: dt.date | None = None) -> dict:
         "today_qty": today_qty,
         "today_hours": today_hours,
         "per_day": dict(sorted(per_day.items())),
+        "per_day_hours": dict(sorted(per_day_hours.items())),
         "per_source": per_source,
         "elapsed_weeks": len(elapsed),
         "expected_now": ref_now,
@@ -303,7 +341,8 @@ def cmd_status(a):
     _u(f"队伍档位    {cfg.get('profile')}   核算模式 {rep['mode']}（report=只统计不拦截）")
     _u("-" * 62)
     _u(f"今日工作量  {rep['today']}  {rep['today_qty']} 件 · {rep['today_hours']:g}h"
-       f"   （按当日真实产出统计，无下限/上限）")
+       f"   （件数无下限/上限；工时下限 {rep['min_daily_hours']:g}h，建议 "
+       f"{rep['preferred_daily_hours'][0]:g}~{rep['preferred_daily_hours'][1]:g}h）")
     _u(f"本周累计    {rep['week_total']} 件   （OA 参考线 {rep['week_min']} 件，仅提示）")
     _u(f"本月累计    {rep['month_total']} 件   （OA 参考线 {rep['month_min']} 件，仅提示）")
     if rep["per_source"]:
@@ -311,20 +350,31 @@ def cmd_status(a):
         for src, b in sorted(rep["per_source"].items(), key=lambda kv: -kv[1]["qty"]):
             _u(f"  - {src}: {b['qty']} 件 / {b['hours']:g}h / {len(b['days'])} 天")
     if rep["per_day"]:
-        _u("每日件数（最近 5 天）：")
+        _u(f"每日明细（最近 5 天，工时下限 {rep['min_daily_hours']:g}h）：")
+        hmap = rep.get("per_day_hours") or {}
         for ds, n in list(rep["per_day"].items())[-5:]:
-            _u(f"  - {ds}: {n} 件")
+            h = hmap.get(ds, 0)
+            flag = "  ⚠️ 工时不足" if rep["min_daily_hours"] > 0 and h < rep["min_daily_hours"] - 1e-9 else ""
+            _u(f"  - {ds}: {n} 件 / {h:g}h{flag}")
     if rep["per_project"]:
         _u("分项目：")
         for code, n in sorted(rep["per_project"].items(), key=lambda kv: -kv[1]):
             _u(f"  - {code}: {n}")
     _u("-" * 62)
     if rep["blocked"]:
-        _u("闸门状态    🔴 已拦截（strict 模式）—— " + "；".join(rep["reasons"]))
+        _u("件数闸门    🔴 已拦截（strict 模式）—— " + "；".join(rep["reasons"]))
     elif rep["reasons"]:
-        _u("参考线       🟡 " + "；".join(rep["reasons"]))
+        _u("件数参考线  🟡 " + "；".join(rep["reasons"]))
     else:
-        _u("参考线       🟢 已达 OA 参考线")
+        _u("件数参考线  🟢 已达 OA 参考线")
+    if not rep["per_day"]:
+        _u(f"工时闸门    ⚪ 本月暂无登记（下限 {rep['min_daily_hours']:g}h/天）")
+    elif rep["days_below_min"]:
+        _u(f"工时闸门    🔴 {len(rep['days_below_min'])} 天低于 {rep['min_daily_hours']:g}h："
+           + "；".join(f"{x['date']} {x['hours']:g}h" for x in rep["days_below_min"]))
+        _u("             → 这些日子出单会被拦，补工时后再导出")
+    else:
+        _u(f"工时闸门    🟢 所有已登记日期均 ≥ {rep['min_daily_hours']:g}h")
     _u("=" * 62)
 
 
@@ -450,6 +500,15 @@ def cmd_log(a):
     if missing:
         _u(f"   ⚠️ 附件未找到，请放入 交付物/：{missing}")
     _u(f"   台账 {ledger_path()}")
+    pol = policy()
+    if pol["min_daily_hours"] > 0:
+        day_h = round(sum(hours_of(r) for r in read_ledger()
+                          if r.get("project") == p["code"] and r.get("date") == d.isoformat()), 2)
+        if day_h < pol["min_daily_hours"] - 1e-9:
+            _u(f"   ⏳ 当日合计 {day_h:g}h，低于下限 {pol['min_daily_hours']:g}h"
+               f"（还差 {pol['min_daily_hours'] - day_h:g}h）—— 还需继续登记，否则出单会被拦。")
+        else:
+            _u(f"   ⏱️ 当日合计 {day_h:g}h（下限 {pol['min_daily_hours']:g}h ✔）")
     for w in warn:
         _u(f"   ⚠️ 枚举未校验：{w}")
     if hits:
@@ -513,6 +572,20 @@ def _write_day(p: dict, d: dt.date) -> Path:
     M.append("")
     M.append(f"> 项目：{p.get('name') or p['code']}｜周次 `{week_label(d)}`｜生成 {dt.datetime.now():%H:%M}")
     M.append("")
+    pol = policy()
+    min_h = pol["min_daily_hours"]
+    lo, hi = (list(pol["preferred_daily_hours"]) + [8.0, 9.0])[:2]
+    if min_h > 0:
+        if round(total_h, 2) < min_h - 1e-9:
+            M.append(f"> ⚠️ **当日合计 {total_h:g}h，低于每日下限 {min_h:g}h（还差 {min_h - total_h:g}h）** —— "
+                     f"补齐后才能提交。")
+        elif total_h < lo:
+            M.append(f"> 当日合计 **{total_h:g}h**（已达到下限 {min_h:g}h，略低于建议区间 {lo:g}~{hi:g}h）。")
+        elif total_h <= hi:
+            M.append(f"> 当日合计 **{total_h:g}h**，落在建议区间 {lo:g}~{hi:g}h 内。")
+        else:
+            M.append(f"> 当日合计 **{total_h:g}h**，高于建议区间 {lo:g}~{hi:g}h —— **不设上限**，只要是真实工时照实填。")
+        M.append("")
     M.append("## 一、清单类型（OA「工作类型」，可多选）")
     M.append("")
     for t in (types or ["【待补】"]):
@@ -643,6 +716,34 @@ def cmd_export_week(a):
     ]
     rows.sort(key=lambda r: r["date"])
 
+    # 每日工时下限（2026-11-02）：本周每天都必须 ≥ min_daily_hours，否则不出单
+    pol = policy()
+    min_h = pol["min_daily_hours"]
+    lo, hi = (list(pol["preferred_daily_hours"]) + [8.0, 9.0])[:2]
+    wk_hours: dict[str, float] = {}
+    for r in rows:
+        wk_hours[r["date"]] = round(wk_hours.get(r["date"], 0.0) + hours_of(r), 2)
+    wk_below = [(ds, h) for ds, h in sorted(wk_hours.items())
+                if min_h > 0 and h < min_h - 1e-9]
+    if wk_below and pol["hours_gate"] == "block" and not a.force:
+        detail = "；".join(f"{ds} {h:g}h（差 {min_h - h:g}h）" for ds, h in wk_below)
+        _u("🔴 出单已拦截 —— 本周有日期工时不足：")
+        _u(f"   {detail}")
+        _u(f"   每日下限 {min_h:g}h（建议 {lo:g}~{hi:g}h，长于 {hi:g}h 也可以，只要真实）。"
+           f"补齐后重跑，或加 --force 强制出单（文本会打红标）。")
+        note = pkg / "工时不足提示.md"
+        note.write_text(
+            "# 当日工时不足提示\n\n"
+            f"> 出单已拦截：每日工时下限 **{min_h:g}h**（建议 {lo:g}~{hi:g}h）。\n\n"
+            "| 日期 | 实际工时 | 缺口 |\n|---|---|---|\n"
+            + "\n".join(f"| {ds} | {h:g}h | {min_h - h:g}h |" for ds, h in wk_below)
+            + "\n\n补齐方式：`oa.py log --date <日期> --entry \"事项|时长|说明\"`，"
+              "工时必须是当天真实发生的工作量，不要虚增。\n",
+            encoding="utf-8",
+        )
+        _u(f"   明细已写入：{note}")
+        sys.exit(EXIT_QUOTA)
+
     dic = dictionaries()
     has_dict = bool(dic.get("work_types") or dic.get("items") or dic.get("deliverable_contents"))
     verified = dic.get("_verified") is True
@@ -657,12 +758,17 @@ def cmd_export_week(a):
     L.append(f"部门小组：{p.get('group') or '【待补】'}      组长：{p.get('leader') or '【待补】'}")
     L.append(f"填报周期：{ws} ~ {we}（上周六~本周五，系统周区间：{ws} - {we}）")
     L.append("")
-    if rep["blocked"] or unverified:
+    if rep["blocked"] or unverified or wk_below:
         L.append("!" * 68)
         if rep["blocked"]:
             L.append("!! 配额未达标，本单为强制出单，存在被组长退回风险：")
             for r in rep["reasons"]:
                 L.append(f"!!   · {r}")
+        if wk_below:
+            L.append(f"!! 有 {len(wk_below)} 天工时低于 {min_h:g}h，本单为强制出单：")
+            for ds, h in wk_below:
+                L.append(f"!!   · {ds} 仅 {h:g}h（差 {min_h - h:g}h）")
+            L.append(f"!! 补足后重新导出；每日工时下限 {min_h:g}h，建议 {lo:g}~{hi:g}h。")
         if unverified:
             if has_dict:
                 L.append("!! 枚举未经系统核对（dictionaries.json 的 _verified = false）：")
@@ -694,7 +800,9 @@ def cmd_export_week(a):
             L.append("  明细：")
             for e in entries:
                 L.append(f"    - {e['item']} | {e['hours']}h | {e['desc']}")
-            L.append(f"  小计：{sum(e['hours'] for e in entries):.1f}h")
+            dh = round(sum(float(e.get("hours") or 0) for e in entries), 2)
+            flag = "" if min_h <= 0 or dh >= min_h - 1e-9 else f"   ⚠️ 低于下限 {min_h:g}h（差 {min_h - dh:g}h）"
+            L.append(f"  小计：{dh:g}h{flag}")
         L.append("")
 
     items, contents, files = {}, {}, []
@@ -732,6 +840,9 @@ def cmd_export_week(a):
     L.append(f"  本周交付物合计：{sum(contents.values())} 件（按当日真实产出逐日登记，无日下限 / 无日上限）")
     if day_qty:
         L.append("  逐日件数：" + "；".join(f"{d0} {n} 件" for d0, n in sorted(day_qty.items())))
+    if wk_hours and min_h > 0:
+        L.append("  逐日工时：" + "；".join(f"{ds} {h:g}h" for ds, h in sorted(wk_hours.items()))
+                 + f"（下限 {min_h:g}h/天）")
     if src_qty:
         L.append("  来源分布：" + "；".join(f"{k} {v} 件" for k, v in sorted(src_qty.items(), key=lambda kv: -kv[1])))
     L.append(f"  本月累计：{rep['month_total']} 件（OA 参考线 {rep['month_min']} 件/月，仅提示、不拦截）")

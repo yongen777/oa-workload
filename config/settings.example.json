@@ -15,6 +15,12 @@
     "daily_cap": 0,
     "_0说明": "0 = 不设限。填了也不会用来驱动生成，仅作异常提示阈值。",
     "target_range": null,
+    "min_daily_hours": 8.0,
+    "_min_daily_hours说明": "每日工时硬下限：低于它直接拦截出单（不是提示）。用户口径「必须大于 7.5，不能低于 8」，所以取 8.0。",
+    "preferred_daily_hours": [8.0, 9.0],
+    "_preferred_daily_hours说明": "建议区间，只用于文案提示。长于上限也可以，只要是真实工时，不设上限。",
+    "hours_gate": "block",
+    "_hours_gate说明": "block = 有日期低于下限就拒绝出单（默认）；warn = 照出但打红标。",
     "require_evidence": true,
     "aggregate_all_sources": true,
     "sources": ["workbuddy", "teleagent", "ai_studio", "other_tool", "manual"]
